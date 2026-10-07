@@ -29,7 +29,7 @@ _COMPATIBLE = {
     ("IX", "SIX"): False, ("IX", "X"): False,
     ("S", "IS"): True, ("S", "IX"): False, ("S", "S"): True,
     ("S", "SIX"): False, ("S", "X"): False,
-    ("SIX", "IS"): False, ("SIX", "IX"): False, ("SIX", "S"): False,
+    ("SIX", "IS"): True, ("SIX", "IX"): False, ("SIX", "S"): False,
     ("SIX", "SIX"): False, ("SIX", "X"): False,
     ("X", "IS"): False, ("X", "IX"): False, ("X", "S"): False,
     ("X", "SIX"): False, ("X", "X"): False,
@@ -133,7 +133,7 @@ class LockManager:
         if pending is not None:
             pending.mode = join(pending.mode, mode)
             return False
-        target = mode
+        target = join(held, mode) if held is not None else mode
         if target == held:
             return True
         if self._must_wait(resource, txn, target):
@@ -143,9 +143,6 @@ class LockManager:
                     "事务 %s 在资源 %s 上申请 %s 会让等待图成环，阻塞者：%s"
                     % (txn, resource, target, ", ".join(blockers))
                 )
-            if held is not None:
-                # 转换请求挂起期间先摘下旧模式，等队首轮到时再重新授予。
-                self._holders[resource].pop(txn)
             self._enqueue(resource, txn, target, timeout)
             return False
         self._set_holder(resource, txn, target)
@@ -171,7 +168,7 @@ class LockManager:
         txn = _key(txn)
         held = list(self._txn_locks.get(txn, ()))
         released = []
-        for resource in held:
+        for resource in reversed(held):
             holders = self._holders.get(resource, {})
             if txn in holders:
                 holders.pop(txn)
@@ -193,6 +190,7 @@ class LockManager:
         if join(held, new_mode) != held:
             raise LockError("%s 不是 %s 的降级目标" % (new_mode, held))
         self._holders[resource][txn] = new_mode
+        self._dispatch(resource)
         return new_mode
 
     def advance(self, ticks=1):
@@ -204,7 +202,7 @@ class LockManager:
             queue = self._queues[resource]
             kept = []
             for waiter in queue:
-                if waiter.deadline is not None and waiter.deadline < now:
+                if waiter.deadline is not None and waiter.deadline <= now:
                     expired.append((waiter.txn, resource, waiter.mode))
                 else:
                     kept.append(waiter)
@@ -266,35 +264,60 @@ class LockManager:
                 return False
         return True
 
+    def _must_wait(self, resource, txn, mode):
+        """队列里已有等待者，或当前持有者容不下时就要排队。"""
+        if self._queues.get(resource):
+            return True
+        return not self._can_grant(resource, txn, mode)
+
+    def _wait_edges(self):
+        """等待图：事务 -> 它正在等待的事务。
+
+        边来自两类阻塞关系：与自己不兼容的持有者，以及同一队列里排在自己
+        前面的所有等待者（队列顺序边，覆盖转换死锁这类环）。
+        """
+        edges = {}
+        for resource, queue in self._queues.items():
+            ahead = set()
+            for waiter in queue:
+                blockers = set(ahead)
+                for holder, held in self._holders.get(resource, {}).items():
+                    if holder != waiter.txn and not compatible(held, waiter.mode):
+                        blockers.add(holder)
+                edges.setdefault(waiter.txn, set()).update(blockers)
+                ahead.add(waiter.txn)
+        return edges
+
+    def _creates_cycle(self, txn, blockers):
+        """假设 txn 新增这些等待边，判断等待图里是否出现经过 txn 的环。
+
+        沿现有等待图从 txn 的阻塞者出发做可达性搜索，能回到 txn 即成环，
+        环可以跨任意多个事务。
+        """
+        edges = self._wait_edges()
+        edges.setdefault(txn, set()).update(blockers)
+        seen = set()
+        stack = list(blockers)
+        while stack:
+            current = stack.pop()
+            if current == txn:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(edges.get(current, ()))
+        return False
+
     def _blockers(self, resource, txn, mode):
-        """阻塞这个请求的事务集合。"""
+        """新请求排在队尾时会阻塞它的事务：冲突持有者加全部在册等待者。"""
         blockers = set()
         for holder, held in self._holders.get(resource, {}).items():
             if holder != txn and not compatible(held, mode):
                 blockers.add(holder)
+        for waiter in self._queues.get(resource, ()):
+            if waiter.txn != txn:
+                blockers.add(waiter.txn)
         return blockers
-
-    def _must_wait(self, resource, txn, mode):
-        """当前持有者容不下这个请求时就要排队。"""
-        return not self._can_grant(resource, txn, mode)
-
-    def _wait_edges(self):
-        """等待图：事务 -> 它正在等待的事务。"""
-        edges = {}
-        for resource, queue in self._queues.items():
-            for waiter in queue:
-                edges.setdefault(waiter.txn, set()).update(
-                    self._blockers(resource, waiter.txn, waiter.mode)
-                )
-        return edges
-
-    def _creates_cycle(self, txn, blockers):
-        """假设 txn 新增这些等待边，判断等待图里是否出现经过 txn 的环。"""
-        edges = self._wait_edges()
-        for blocker in blockers:
-            if txn in edges.get(blocker, ()):
-                return True
-        return False
 
     def _enqueue(self, resource, txn, mode, timeout):
         """把请求按到达顺序放进等待队列。"""
